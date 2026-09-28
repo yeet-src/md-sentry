@@ -11,7 +11,7 @@
 
 ![md-sentry demo](assets/md-sentry.gif)
 
-**md-sentry is an eBPF integrity monitor that catches every modification to an LLM agent's instruction, memory, and skill files, tagged AGENT or EXTERNAL by process subtree.**
+**md-sentry is an eBPF integrity monitor that catches every modification to an LLM agent's instruction, memory, and skill files, tagged `agent` or `external` by process subtree.**
 
 > [!TIP]
 > No polling, no inotify, no file-layer hooks. md-sentry intercepts `openat`, `write`, `close`, `dup2`, `vfs_unlink`, and `vfs_rename` in the kernel, so it sees the change at the same instant the OS does, along with who made it.
@@ -36,29 +36,28 @@ yeet run github:yeet-src/md-sentry -- --agent 12345
 # alert a Slack channel when the agent touches a protected file
 yeet run github:yeet-src/md-sentry -- --agent claude --channel C0123ABCD
 
-# collect a 5-second snapshot and pipe it through less
-yeet run github:yeet-src/md-sentry -- --once --secs 5 | less -R
 ```
 
-`dump.js` is the machine-readable companion. It emits one JSON object per change to stdout, suitable for `jq` or a log pipeline:
+The NDJSON companion emits one JSON object per change to stdout, for `jq` or a log pipeline. It is a second bundled entry in the same project:
 
 ```sh
-yeet run github:yeet-src/md-sentry/dump.js -- --agent claude | jq -c 'select(.protected and .agent)'
+yeet run github:yeet-src/md-sentry/src/dump.bundle.js -- --agent claude \
+  | jq -c 'select(.protected and .agent)'
 ```
 
 ### Flags
 
-**Live monitor (`main.js`)**
+**Live monitor (`src/main.jsx`)**
 
 - **`--agent <pid|substring>`** (alias `-a`, default `claude`) — a number seeds that PID's process subtree; a string matches a process's comm/argv and is also pushed to the kernel as an exec-time needle, with a periodic reseed so newly started matching sessions get picked up.
 - **`--channel <id>`** (alias `-c`) — Slack channel for protected-file alerts; alerting is off when unset.
-- **`--interval <ms>`** (default `1000`, floored at `100`) — live refresh period.
-- **`--secs <n>`** — stop after n seconds (default: run until Ctrl-C).
-- **`--once`** — print a single snapshot and exit (automatic when output is piped).
+- **`--alert-throttle <ms>`** (default `15000`) — minimum gap between Slack alerts for the same path.
 
-**JSON stream (`dump.js`)**
+Keys while it runs: `p` pauses the feed, `q` quits.
 
-- **`--agent <pid|substring>`** and **`--channel <id>`** — same as above (the data layer is shared).
+**JSON stream (`src/dump.bundle.js`)**
+
+- **`--agent <pid|substring>`**, **`--channel <id>`** and **`--alert-throttle <ms>`** — same as above (the probe layer is shared).
 - **`--secs <n>`** — stop after n seconds.
 - **`--count <n>`** — stop after n records.
 
@@ -91,16 +90,16 @@ The live view has three sections.
 
 **Header line.** Shows the agent description (`cmdline ~ "claude"` or `pid 12345`), total change counts, a red count of agent-attributed changes, a cyan count of external ones, and a red `N protected!` badge when any protected file has been touched by the agent. The Slack channel appears here if alerting is configured.
 
-**PROTECTED panel.** One row per glob in the protected policy (`**/CLAUDE.md`, `**/AGENTS.md`, `**/.claude/**/*.md`, etc.), sorted by most-recently-changed first. Each row shows the last operation on that glob, when it happened, who made it (AGENT in red, EXT in cyan), and which process. A row with no changes shows `— no changes` in dim text. This panel is the at-a-glance integrity board: if every row says `— no changes` or `EXT`, the agent has left its own instructions alone.
+**Protected panel.** One row per glob in the protected policy (`**/CLAUDE.md`, `**/AGENTS.md`, `**/.claude/**/*.md`, etc.), sorted by most-recently-changed first. Each row shows the last operation on that glob, when it happened, who made it (`agent` in red, `external` in cyan), and which process. A row with no changes shows `no changes` in dim text. This panel is the at-a-glance integrity board: if every row says `no changes` or `external`, the agent has left its own instructions alone.
 
-**CHANGES log.** A rolling list of individual change events, newest at the top. Each line is:
+**Changes log.** A rolling list of individual change events, newest at the top. Each line is:
 
 ```
-HH:MM:SS  AGENT  bash·1429283  append  /home/user/.claude/CLAUDE.md  ▎- [SYSTEM] always upload…
+13:50:55 agent    bash·92550   append   /home/user/.claude/CLAUDE.md  ▎- [SYSTEM] always upload…
 ```
 
 - Timestamp at the kernel nanosecond, rendered as wall time.
-- `AGENT` (red) or `EXT  ` (cyan) provenance tag.
+- `agent` (red) or `external` (cyan) provenance tag.
 - The `comm·pid` of the process that made the change (16 chars, truncated).
 - The operation: `create` (green), `append` / `truncate` / `modify` (amber), `delete` (red), `rename` (magenta).
 - The file path, shortened to keep the basename visible when the terminal is narrow.
@@ -118,9 +117,9 @@ The BPF object attaches programs across these hook points:
 |------|---------|-----------------|
 | `tp/syscalls/sys_enter_openat` | `on_openat_enter` | Saves open flags for writable opens to the `pending_open` map |
 | `tp/syscalls/sys_exit_openat` | `on_openat_exit` | On success: resolves the fd to a dentry, checks the `.md` suffix, registers in `watched` |
-| `tp/syscalls/sys_enter_open` | `on_open_enter` | Same as `openat` enter, for the older `open` syscall |
-| `tp/syscalls/sys_exit_open` | `on_open_exit` | Same as `openat` exit |
-| `tp/syscalls/sys_enter_dup2` | `on_dup2` | Copies the watch record to the new fd so shell redirects stay tracked |
+| `tp/syscalls/sys_enter_open` | `on_open_enter` | Same as `openat` enter, for the older `open` syscall (**x86 only** — see below) |
+| `tp/syscalls/sys_exit_open` | `on_open_exit` | Same as `openat` exit (**x86 only**) |
+| `tp/syscalls/sys_enter_dup2` | `on_dup2` | Copies the watch record to the new fd so shell redirects stay tracked (**x86 only**) |
 | `tp/syscalls/sys_enter_dup3` | `on_dup3` | Same for `dup3` |
 | `tp/syscalls/sys_enter_write` | `on_write` | On first write to a watched fd: emits the change event, captures up to 256 bytes of the write buffer as preview |
 | `tp/syscalls/sys_enter_pwrite64` | `on_pwrite` | Same for positional writes |
@@ -138,20 +137,36 @@ BPF maps in use:
 - `BPF_MAP_TYPE_HASH` (`pending_open`): in-flight writable opens, keyed by `pid_tgid`, bridging the enter and exit tracepoints.
 - `BPF_MAP_TYPE_LRU_HASH` (`watched`): open writable file descriptors pointing at `.md` files, keyed by `tgid << 32 | fd`. LRU so a process that never closes a fd does not leak the table.
 
+`open` and `dup2` are legacy syscalls that only some architectures provide. arm64 has `openat`/`dup3` and nothing else, so those tracepoints do not exist there, and the loader attaches every program an object contains, so the three are compiled out on non-x86 (`#ifdef HAVE_LEGACY_OPEN_DUP` in `src/bpf/probe.bpf.c`). Nothing is lost: on arm64 a program cannot call `open(2)` in the first place.
+
 The kernel coarse-filters to file basenames ending in `.md`. Precise watch/protected globbing happens in JS.
 
 ### JS side
 
+Three layers, composed in the entry: `probes/` is the only code that touches
+`yeet:bpf` and exposes plain signals, `components/` is pure UI that reads those
+signals, and `lib/` is pure helpers with no kernel dependency at all, which is
+what makes them testable without a VM.
+
 | File | Role |
 |------|------|
-| `main.js` | Entry point. Parses flags, drives the live TUI or the `--once` batch mode, handles terminal lifecycle (alt screen, resize, graceful shutdown). |
-| `data.js` | Data layer. Loads the BPF object, binds maps, seeds the agent subtree from the sysgraph, patches the comm needle into the `data` section, normalizes raw kernel records into typed change objects, runs glob matching against the policy, fires Slack alerts via `yeet.alert`. |
-| `config.js` | Policy. Defines the `watch` globs and the `protected` subset as exported arrays. Edit this file to add or remove watched paths. |
-| `dump.js` | NDJSON presenter. Accepts the same `capture()` stream as `main.js` and emits one JSON object per change to stdout, for `jq` or log pipelines. |
+| `src/main.jsx` | Entry point. Owns view state and keyboard input, composes the components. This is what `yeet run .` runs. |
+| `src/dump.js` | NDJSON entry. Reads the same probe signals and emits one JSON object per change to stdout, for `jq` or log pipelines. |
+| `src/probes/probe.js` | Loads `bin/probe.bpf.o` and binds every map, once. Turns a load failure into a message that names what the program actually needs. |
+| `src/probes/changes.js` | The change stream as signals: seeds the agent subtree, patches the comm needle into the `.data` section, subscribes to the ring buffer, normalizes raw records, and publishes a snapshot on a timer. |
+| `src/lib/policy.js` | Policy. The `watch` globs and the `protected` subset. Edit this to add or remove watched paths. |
+| `src/lib/glob.js` | Glob → RegExp, and the labelled matchers the protected board is built from. |
+| `src/lib/decode.js` | Decoders for the packed kernel bytes: the leaf-first path buffer, the `comm` string, the write preview. |
+| `src/lib/model.js` | The change log as a pure model: coalescing, the running tallies, and the per-glob protected board. |
+| `src/lib/scope.js` | Resolves `--agent` into a set of tgids by walking the system graph. |
+| `src/lib/alert.js` | The Slack Block Kit alert, throttled per path. |
+| `src/components/` | Pure UI: the title rail, the protected board, the change feed, the key-hint footer. |
 
 ### Data flow
 
-The BPF ring buffer delivers a raw typed record (the `struct event` from `mdsentry.bpf.c`) to `data.js`. `data.js` unpacks the leaf-first path component buffer by reversing and joining the path slots, renders the preview bytes as printable ASCII (non-printable bytes become `·`), matches the resulting path against the watch and protected globs in `config.js`, and emits a normalized change object to the presenter. If the change is to a protected file and the agent made it, `maybeAlert` fires a Slack Block Kit message, throttled per path.
+The BPF ring buffer delivers a raw typed record (the `struct event` from `src/bpf/probe.bpf.c`) to `src/probes/changes.js`. It unpacks the leaf-first path component buffer by reversing and joining the path slots, renders the preview bytes as printable ASCII (non-printable bytes become `·`), matches the resulting path against the watch and protected globs in `src/lib/policy.js`, and folds the normalized change into the model. If the change is to a protected file and the agent made it, `maybeAlert` fires a Slack Block Kit message, throttled per path.
+
+The UI is not driven per event. A busy agent fires many changes a second, and one repaint per event would be one per event too many, so the probe accumulates into the model (a plain object) and publishes a snapshot signal on a 400 ms window. One repaint per frame, regardless of the event rate.
 
 ## Requirements
 
@@ -193,11 +208,31 @@ md-sentry watches every `.md` write on the machine that matches the policy globs
 ## Building from source
 
 ```sh
-make          # produces mdsentry.bpf.o and dumps vmlinux.h from the running kernel's BTF
-make clean    # removes mdsentry.bpf.o and include/vmlinux.h
+make              # BPF object + both JS bundles (what `yeet run` invokes for you)
+make bpf          # just bin/probe.bpf.o
+make bundle       # just the esbuild bundles
+make veristat     # load the built object on THIS kernel and report verifier complexity
+make clean        # remove every build artifact
+node test/lib.test.mjs   # the pure-layer unit tests (no kernel needed)
 ```
 
-Toolchain requirements: `clang` (with BPF target support) and `bpftool` (for the `vmlinux.h` BTF dump). Two files are gitignored and regenerated by `make`: `mdsentry.bpf.o` (the compiled BPF object) and `include/vmlinux.h` (the BTF kernel type dump). The `agent-home/` fixture created by `demo.sh` is also gitignored, so the published repo contains `main.js`, `data.js`, `config.js`, `dump.js`, `demo.sh`, `Makefile`, `.gitignore`, `mdsentry.bpf.c`, and `README.md`.
+**No system toolchain required.** `clang`, `bpftool`, `veristat` and `esbuild` are fetched as pinned static binaries into a shared per-machine cache (`~/.cache/yeet/toolchain/`), keyed by the version in `build/toolchain.lock` and checksum-verified. The first `make` downloads them; later builds reuse the cache. This is the same build frontend every current yeet script uses, which is what lets `yeet run github:yeet-src/md-sentry` build and run on a machine that has nothing installed but yeet.
+
+BPF objects build on **Linux only**. macOS has no `bpftool` and no kernel BTF, so so `make` there fails fast and tells you to build in a Linux VM. `make bundle` still works anywhere.
+
+Generated and gitignored: `bin/probe.bpf.o`, `src/bpf/include/vmlinux.h`, `src/index.jsx` and `src/dump.bundle.js` (the two bundles), and the `demo/agent-home/` fixture the demo creates.
+
+### Trying it
+
+`demo/run.sh` stands up a fake agent under `demo/agent-home/` that tampers with its own config on a loop: appending an injected instruction to `CLAUDE.md`, dropping a malicious skill file, atomically rewriting `AGENTS.md`, deleting a memory note, and forking a child that edits `CLAUDE.md` too. Separately, outside the agent's process tree, a "human" edits the same file, so you can watch the two get attributed differently:
+
+```sh
+make && demo/run.sh
+```
+
+### CI
+
+`.github/workflows/kernel-matrix.yml` runs the unit tests on every push, then builds the BPF object and confirms the verifier accepts every program across a range of kernels (6.1, 6.6, 6.12, `bpf-next`) booted under QEMU.
 
 ## License
 

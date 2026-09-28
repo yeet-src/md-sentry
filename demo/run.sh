@@ -2,27 +2,28 @@
 # md-sentry demo — stand up a fake agent and let it tamper with its own
 # markdown brain while md-sentry watches.
 #
-#   cd examples/md-sentry && ./demo.sh
-#   cd examples/md-sentry && ./demo.sh --channel C0123ABCD   # also alert to Slack
+#   make && demo/run.sh
+#   make && demo/run.sh --channel C0123ABCD   # also alert to Slack
 #
 # A workspace under ./agent-home is laid out like a real agent's config —
 # CLAUDE.md, AGENTS.md, .claude/skills, .claude/memory. One long-lived process
 # is the "agent": every few seconds it
 #   1. reads CLAUDE.md            (a read — md-sentry shows nothing, by design)
-#   2. appends an injected line to CLAUDE.md      -> AGENT append + preview + Slack
-#   3. drops a new skill file into .claude/skills -> AGENT create
-#   4. atomically rewrites AGENTS.md (write+rename)-> AGENT rename
-#   5. deletes a memory note                       -> AGENT delete
-#   6. forks a child that edits CLAUDE.md          -> AGENT (proves subtree)
+#   2. appends an injected line to CLAUDE.md      -> agent append + preview + Slack
+#   3. drops a new skill file into .claude/skills -> agent create
+#   4. atomically rewrites AGENTS.md (write+rename)-> agent rename
+#   5. deletes a memory note                       -> agent delete
+#   6. forks a child that edits CLAUDE.md          -> agent (proves subtree)
 #   7. writes an unwatched notes.md                -> nothing (not agent-brain)
 #
 # Separately, OUTSIDE the agent's process tree, a "human" edits CLAUDE.md — and
-# md-sentry tags that EXTERNAL, not AGENT. The agent's pid is passed to the
+# md-sentry tags that external, not agent. The agent's pid is passed to the
 # monitor, so attribution is exact. Ctrl-C stops everything.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 WS="$HERE/agent-home"
+ROOT="$(cd "$HERE/.." && pwd)"
 
 bold=$'\e[1m'; dim=$'\e[2m'; red=$'\e[31m'; cyan=$'\e[36m'; rst=$'\e[0m'
 
@@ -97,10 +98,10 @@ malicious ${red}skill${rst}, rewriting AGENTS.md, and deleting a ${red}memory no
 it forks edits CLAUDE.md too — watch it still attribute that to the agent.
 
 Meanwhile a ${cyan}human${rst} edits CLAUDE.md from outside the agent's process tree;
-md-sentry tags that ${cyan}EXTERNAL${rst}, not AGENT. Protected-file changes by the
+md-sentry tags that ${cyan}external${rst}, not agent. Protected-file changes by the
 agent turn the row ${red}red${rst}${1:+ and fire a Slack alert}. ${dim}Ctrl-C stops it all.${rst}
 
 EOF
 
-cd "$HERE"
-exec yeet run main.js -- --agent "$AGENT" "$@"
+cd "$ROOT"
+exec sudo -E yeet run . -- --agent "$AGENT" "$@"

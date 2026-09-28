@@ -1,0 +1,8 @@
+{
+  "name": "md-sentry",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "md-sentry — kernel-level integrity monitor for an LLM agent's markdown brain.",
+  "dependencies": {}
+}
