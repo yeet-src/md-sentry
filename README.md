@@ -49,7 +49,7 @@ yeet run github:yeet-src/md-sentry/src/dump.bundle.js -- --agent claude \
 
 **Live monitor (`src/main.jsx`)**
 
-- **`--agent <pid|substring>`** (alias `-a`, default `claude`) — a number seeds that PID's process subtree; a string matches a process's comm/argv and is also pushed to the kernel as an exec-time needle, with a periodic reseed so newly started matching sessions get picked up.
+- **`--agent <pid|substring>`** (alias `-a`, default `claude`). A number seeds that PID's process subtree, which is the exact option: everything that forks from it is attributed to the agent, however deep. A string is matched two ways, and they do not have the same reach: the startup seed (and the 5-second reseed) scans the system graph and matches against **comm or argv[0]**, while the kernel's exec-time needle can only compare **comm**, which is capped at 15 characters. So prefer `--agent <pid>` when you know it.
 - **`--channel <id>`** (alias `-c`) — Slack channel for protected-file alerts; alerting is off when unset.
 - **`--alert-throttle <ms>`** (default `15000`) — minimum gap between Slack alerts for the same path.
 
@@ -153,7 +153,7 @@ what makes them testable without a VM.
 | `src/main.jsx` | Entry point. Owns view state and keyboard input, composes the components. This is what `yeet run .` runs. |
 | `src/dump.js` | NDJSON entry. Reads the same probe signals and emits one JSON object per change to stdout, for `jq` or log pipelines. |
 | `src/probes/probe.js` | Loads `bin/probe.bpf.o` and binds every map, once. Turns a load failure into a message that names what the program actually needs. |
-| `src/probes/changes.js` | The change stream as signals: seeds the agent subtree, patches the comm needle into the `.data` section, subscribes to the ring buffer, normalizes raw records, and publishes a snapshot on a timer. |
+| `src/probes/changes.js` | The change stream as signals: seeds the agent subtree, patches the comm needle into the `.bss` section, subscribes to the ring buffer, normalizes raw records, and publishes a snapshot on a timer. |
 | `src/lib/policy.js` | Policy. The `watch` globs and the `protected` subset. Edit this to add or remove watched paths. |
 | `src/lib/glob.js` | Glob → RegExp, and the labelled matchers the protected board is built from. |
 | `src/lib/decode.js` | Decoders for the packed kernel bytes: the leaf-first path buffer, the `comm` string, the write preview. |
@@ -186,6 +186,7 @@ The UI is not driven per event. A busy agent fires many changes a second, and on
 - **Path reconstructed from the mount root, not `/`.** The dentry parent walk stops at the mount boundary. A file on a bind-mount or a tmpfs has its path reported relative to that mount's root. The globs in `config.js` are tail-anchored (`**/CLAUDE.md`) to match regardless, but the displayed path can look shorter than the real absolute path.
 - **No visibility into `mmap`-based writes.** A process that maps a file with `mmap` and writes through the mapping never calls `write` or `pwrite64`. md-sentry will not see those changes. This is a real gap for editors and runtimes that use memory-mapped I/O.
 - **Slack delivery depends on the daemon's config.** The alert path is guarded and degrades silently when `yeet.alert` is unavailable or no channel is set, so verify end-to-end Slack delivery in your environment before relying on it.
+- **Comm-match mode matches `comm`, which is not the script name you think it is.** A process started via `#!/usr/bin/env bash` has `comm=bash`, not `myagent.sh`; only a direct `#!/bin/bash` shebang gives the script's own name. `comm` is also truncated to 15 characters. The startup seed also checks `argv[0]`, so it is more forgiving, but the kernel's exec-time adoption path only ever sees `comm`. If attribution looks wrong, pass `--agent <pid>` instead of a name.
 - **Subtree membership is best-effort at startup.** The initial seed queries the sysgraph for current processes. A process already running before md-sentry attached, whose parent has since exited, can be missed if the comm needle does not match it. The periodic reseed (in comm-match mode) closes most of this window.
 
 ## Community questions
@@ -224,11 +225,21 @@ Generated and gitignored: `bin/probe.bpf.o`, `src/bpf/include/vmlinux.h`, `src/i
 
 ### Trying it
 
-`demo/run.sh` stands up a fake agent under `demo/agent-home/` that tampers with its own config on a loop: appending an injected instruction to `CLAUDE.md`, dropping a malicious skill file, atomically rewriting `AGENTS.md`, deleting a memory note, and forking a child that edits `CLAUDE.md` too. Separately, outside the agent's process tree, a "human" edits the same file, so you can watch the two get attributed differently:
+Two demos. Both stand up a fake agent workspace under `demo/agent-home/` laid out like real agent config (`CLAUDE.md`, `AGENTS.md`, `.claude/skills`, `.claude/memory`), and both scope the monitor by **pid**, so attribution is exact rather than a comm guess.
+
+**`demo/sandbox.sh` puts you in the agent's seat.** It splits a tmux window: md-sentry on top, and below it a shell that *is* the agent's process tree. Anything you type there is tagged `agent`; anything you do from a second terminal is tagged `external`. The shell greets you with a cheat sheet of things to try (an injected append, a dropped skill file, an atomic rewrite, a forked child, and one write the policy should ignore). This is the fastest way to feel what the tool actually distinguishes:
+
+```sh
+make && demo/sandbox.sh
+```
+
+**`demo/run.sh` runs itself.** A scripted agent tampers with its own config on a loop while a "human" edits the same file from outside its process tree, so you can watch the two get attributed differently without typing anything:
 
 ```sh
 make && demo/run.sh
 ```
+
+`test/traffic.sh` is the integration counterpart: it exercises the cases a simple append loop never reaches (atomic rewrite, deep nested paths, 30 rapid appends that must coalesce into one row, renames in and out of the policy, a bare `touch`, and two writes that must be dropped). Its header documents what a correct capture looks like for each.
 
 ### CI
 
