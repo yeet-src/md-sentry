@@ -394,6 +394,20 @@ int on_openat_exit(struct trace_event_raw_sys_exit *ctx)
     return open_exit(ctx->ret);
 }
 
+/* `open` and `dup2` are LEGACY syscalls that only some architectures provide.
+ * arm64 has openat/dup3 and nothing else, so `sys_enter_open` and
+ * `sys_enter_dup2` are not tracepoints there at all — and the loader attaches
+ * every program an object contains, so shipping them unconditionally made
+ * md-sentry fail to start on arm64 with nothing but "failed to attach BPF
+ * program". libbpf's `SEC("?...")` autoload flag does NOT help: it stops the
+ * pinning, not the attach. So the programs have to be absent from the object,
+ * which means compiling them out. x86_64 still gets them, so a program that
+ * calls open(2) or dup2(2) is still covered where those syscalls exist. */
+#if defined(__TARGET_ARCH_x86)
+#define HAVE_LEGACY_OPEN_DUP 1
+#endif
+
+#ifdef HAVE_LEGACY_OPEN_DUP
 SEC("tp/syscalls/sys_enter_open")
 int on_open_enter(struct trace_event_raw_sys_enter *ctx)
 {
@@ -405,6 +419,7 @@ int on_open_exit(struct trace_event_raw_sys_exit *ctx)
 {
     return open_exit(ctx->ret);
 }
+#endif /* HAVE_LEGACY_OPEN_DUP */
 
 /* A redirected write (`echo >> CLAUDE.md`) opens the file on one fd, dup2's
  * it onto another (stdout), and writes there — so the write never names the
@@ -426,12 +441,14 @@ static __always_inline void dup_watch(__u32 oldfd, __u32 newfd)
     bpf_map_update_elem(&watched, &nk, &nw, BPF_ANY);
 }
 
+#ifdef HAVE_LEGACY_OPEN_DUP
 SEC("tp/syscalls/sys_enter_dup2")
 int on_dup2(struct trace_event_raw_sys_enter *ctx)
 {
     dup_watch((__u32)ctx->args[0], (__u32)ctx->args[1]);
     return 0;
 }
+#endif /* HAVE_LEGACY_OPEN_DUP */
 
 SEC("tp/syscalls/sys_enter_dup3")
 int on_dup3(struct trace_event_raw_sys_enter *ctx)

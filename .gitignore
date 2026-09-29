@@ -1,8 +1,16 @@
-# Build artifact from `make` — regenerated locally.
-*.o
+# build artifacts
+/node_modules/
+/src/index.jsx
+/src/dump.bundle.js
+/.build/
 
-# Generated from the running kernel's BTF by `make`; large and host-specific.
-/include/vmlinux.h
+# compiled BPF objects + generated CO-RE header
+/bin/*
+!/bin/.gitkeep
+/src/bpf/include/vmlinux.h
 
-# Scratch agent workspace created by demo.sh.
-/agent-home
+# kernel-matrix run output (build/kernel-matrix.sh)
+/.kmatrix/
+
+# Scratch agent workspace created by demo/run.sh.
+/demo/agent-home/

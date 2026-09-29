@@ -12,9 +12,9 @@
  * the event worth a red row and a Slack alert. Keep `protected` a subset of
  * `watch`.
  *
- * Default export so data.js can import the whole policy as one object. There
- * is no filesystem in the isolate — this ships as code, not a file read at
- * runtime. */
+ * Default export so probes/changes.js can import the whole policy as one
+ * object. There is no filesystem in the isolate — this ships as code, not a
+ * file read at runtime. */
 
 const watch = [
   "**/CLAUDE.md", // Claude Code / Claude project instructions
