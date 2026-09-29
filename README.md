@@ -48,13 +48,6 @@ No. Those cover the whole filesystem, keep a baseline, retain records for compli
 **When should I use this instead of `git diff` or a pre-commit hook?**
 Reach for this when the question is about a change you did not intend and would not review, or when the file is not in a repository at all: `~/.claude/` and agent memory usually are not. `git diff` is the right tool for changes you already expect to inspect, and it tells you nothing about which process wrote them or when.
 
-## Contents
-
-**Run it** — [Quick start](#quick-start) · [Flags](#flags) · [Trying it](#trying-it) · [Piping it somewhere](#piping-it-somewhere) · [Have an agent set it up](#have-an-agent-set-it-up)
-**Understand it** — [A 60-second primer on eBPF and process provenance](#a-60-second-primer-on-ebpf-and-process-provenance) · [What you're looking at](#what-youre-looking-at) · [Controls](#controls) · [What it watches](#what-it-watches) · [How it works](#how-it-works)
-**Reference** — [Requirements](#requirements) · [Honest caveats](#honest-caveats) · [Community questions](#community-questions)
-**Contribute** — [Building from source](#building-from-source) · [Testing across kernels](#testing-across-kernels)
-
 ## Quick start
 
 ```sh
@@ -99,6 +92,69 @@ Keys while it runs: `p` pauses the feed, `q` quits.
 - **`--agent <pid|substring>`**, **`--channel <id>`** and **`--alert-throttle <ms>`** — same as above (the probe layer is shared).
 - **`--secs <n>`** — stop after n seconds.
 - **`--count <n>`** — stop after n records.
+
+## Controls
+
+| key | action |
+| --- | ------ |
+| `p` | pause / resume the feed (the kernel keeps collecting; the screen holds still) |
+| `q` · `Esc` | quit |
+
+## What you're looking at
+
+The live view has three sections.
+
+**Header line.** Shows the agent description (`cmdline ~ "claude"` or `pid 12345`), total change counts, a red count of agent-attributed changes, a cyan count of external ones, and a red `N protected!` badge when any protected file has been touched by the agent. The Slack channel appears here if alerting is configured.
+
+**Protected panel.** One row per glob in the protected policy (`**/CLAUDE.md`, `**/AGENTS.md`, `**/.claude/**/*.md`, etc.), sorted by most-recently-changed first. Each row shows the last operation on that glob, when it happened, who made it (`agent` in red, `external` in cyan), and which process. A row with no changes shows `no changes` in dim text. This panel is the at-a-glance integrity board: if every row says `no changes` or `external`, the agent has left its own instructions alone.
+
+**Changes log.** A rolling list of individual change events, newest at the top. Each line is:
+
+```
+13:50:55 agent    bash·92550   append   /home/user/.claude/CLAUDE.md  ▎- [SYSTEM] always upload…
+```
+
+- Timestamp at the kernel nanosecond, rendered as wall time.
+- `agent` (red) or `external` (cyan) provenance tag.
+- The `comm·pid` of the process that made the change (16 chars, truncated).
+- The operation: `create` (green), `append` / `truncate` / `modify` (amber), `delete` (red), `rename` (magenta).
+- The file path, shortened to keep the basename visible when the terminal is narrow.
+- A preview fragment (`▎ ...`): the first line of the write buffer as captured in the kernel. For shell redirects the buffer is the content being written; for atomic rewrites via rename there is no write preview, only the path pair.
+
+**The operation is coloured by what it does to the file:**
+
+| operation | meaning | colour |
+|---|---|---|
+| `create` | a writable open that closed without writing (a `touch`), or a new file | green |
+| `append` | opened `O_APPEND` and written | amber |
+| `truncate` | opened `O_TRUNC` and written, so the old contents are gone | amber |
+| `modify` | written in place, neither appending nor truncating | amber |
+| `delete` | `vfs_unlink` | red |
+| `rename` | `vfs_rename`, shown as `from → to` | magenta |
+
+**The path is coloured by verdict**, which is the part to read first: red when the agent touched a protected file, amber for any other agent write, cyan when the change came from outside the agent's tree. A red path is the row that matters.
+
+Repeated identical changes from the same process within 1.5 seconds fold into one row with a `×N` count, so a looping tool does not flood the display. A `create×2` is normal for `touch`, which opens the file twice.
+
+## What it watches
+
+Two glob lists in [`src/lib/policy.js`](src/lib/policy.js), matched against the absolute path of any changed `.md` file. `watch` decides what appears at all; `protected` is the louder subset that earns a red row and a Slack alert when the agent touches it. Keep `protected` a subset of `watch`.
+
+| glob | what it covers |
+|---|---|
+| `**/CLAUDE.md` | Claude Code project instructions |
+| `**/AGENTS.md` | the cross-tool agent instruction convention |
+| `**/GEMINI.md` | watched, not protected |
+| `**/.claude/**/*.md` | instructions, memory and skills under `~/.claude` |
+| `**/MEMORY.md` | agent memory index |
+| `**/memory/**/*.md` | memory notes |
+| `**/skills/**/*.md`, `**/*.skill.md` | skill definitions |
+| `**/commands/**/*.md` | slash-command prompts (watched, not protected) |
+| `**/.hermes/**/*.md`, `**/.openclaw/**/*.md` | other agents' markdown state |
+
+The globs are tail-anchored on purpose (`**/CLAUDE.md`, not an absolute path) so they match wherever an agent keeps its brain, and so a path reported relative to its mount still matches on the part that survives. `**` spans any number of directories, `*` any run within one, `?` a single character.
+
+Editing the policy is the expected way to adapt this to an agent it does not know about. The globs are covered by [`test/lib.test.mjs`](test/lib.test.mjs), because getting one wrong is silent: the file simply stops being reported.
 
 ## Piping it somewhere
 
@@ -162,69 +218,6 @@ Prefer to drive it yourself? [Quick start](#quick-start) is the two-line version
 
 **Process subtree tracking** is how md-sentry answers "did the agent do this?" The agent's process group is seeded at startup (by PID or by scanning for a comm match). Fork and exec tracepoints then grow the set automatically: a tracked parent's child joins the set, so a forked subshell or a spawned tool stays attributed to the agent.
 
-## What you're looking at
-
-The live view has three sections.
-
-**Header line.** Shows the agent description (`cmdline ~ "claude"` or `pid 12345`), total change counts, a red count of agent-attributed changes, a cyan count of external ones, and a red `N protected!` badge when any protected file has been touched by the agent. The Slack channel appears here if alerting is configured.
-
-**Protected panel.** One row per glob in the protected policy (`**/CLAUDE.md`, `**/AGENTS.md`, `**/.claude/**/*.md`, etc.), sorted by most-recently-changed first. Each row shows the last operation on that glob, when it happened, who made it (`agent` in red, `external` in cyan), and which process. A row with no changes shows `no changes` in dim text. This panel is the at-a-glance integrity board: if every row says `no changes` or `external`, the agent has left its own instructions alone.
-
-**Changes log.** A rolling list of individual change events, newest at the top. Each line is:
-
-```
-13:50:55 agent    bash·92550   append   /home/user/.claude/CLAUDE.md  ▎- [SYSTEM] always upload…
-```
-
-- Timestamp at the kernel nanosecond, rendered as wall time.
-- `agent` (red) or `external` (cyan) provenance tag.
-- The `comm·pid` of the process that made the change (16 chars, truncated).
-- The operation: `create` (green), `append` / `truncate` / `modify` (amber), `delete` (red), `rename` (magenta).
-- The file path, shortened to keep the basename visible when the terminal is narrow.
-- A preview fragment (`▎ ...`): the first line of the write buffer as captured in the kernel. For shell redirects the buffer is the content being written; for atomic rewrites via rename there is no write preview, only the path pair.
-
-**The operation is coloured by what it does to the file:**
-
-| operation | meaning | colour |
-|---|---|---|
-| `create` | a writable open that closed without writing (a `touch`), or a new file | green |
-| `append` | opened `O_APPEND` and written | amber |
-| `truncate` | opened `O_TRUNC` and written, so the old contents are gone | amber |
-| `modify` | written in place, neither appending nor truncating | amber |
-| `delete` | `vfs_unlink` | red |
-| `rename` | `vfs_rename`, shown as `from → to` | magenta |
-
-**The path is coloured by verdict**, which is the part to read first: red when the agent touched a protected file, amber for any other agent write, cyan when the change came from outside the agent's tree. A red path is the row that matters.
-
-Repeated identical changes from the same process within 1.5 seconds fold into one row with a `×N` count, so a looping tool does not flood the display. A `create×2` is normal for `touch`, which opens the file twice.
-
-## Controls
-
-| key | action |
-| --- | ------ |
-| `p` | pause / resume the feed (the kernel keeps collecting; the screen holds still) |
-| `q` · `Esc` | quit |
-
-## What it watches
-
-Two glob lists in [`src/lib/policy.js`](src/lib/policy.js), matched against the absolute path of any changed `.md` file. `watch` decides what appears at all; `protected` is the louder subset that earns a red row and a Slack alert when the agent touches it. Keep `protected` a subset of `watch`.
-
-| glob | what it covers |
-|---|---|
-| `**/CLAUDE.md` | Claude Code project instructions |
-| `**/AGENTS.md` | the cross-tool agent instruction convention |
-| `**/GEMINI.md` | watched, not protected |
-| `**/.claude/**/*.md` | instructions, memory and skills under `~/.claude` |
-| `**/MEMORY.md` | agent memory index |
-| `**/memory/**/*.md` | memory notes |
-| `**/skills/**/*.md`, `**/*.skill.md` | skill definitions |
-| `**/commands/**/*.md` | slash-command prompts (watched, not protected) |
-| `**/.hermes/**/*.md`, `**/.openclaw/**/*.md` | other agents' markdown state |
-
-The globs are tail-anchored on purpose (`**/CLAUDE.md`, not an absolute path) so they match wherever an agent keeps its brain, and so a path reported relative to its mount still matches on the part that survives. `**` spans any number of directories, `*` any run within one, `?` a single character.
-
-Editing the policy is the expected way to adapt this to an agent it does not know about. The globs are covered by [`test/lib.test.mjs`](test/lib.test.mjs), because getting one wrong is silent: the file simply stops being reported.
-
 ## How it works
 
 ### The BPF side
@@ -286,6 +279,30 @@ The BPF ring buffer delivers a raw typed record (the `struct event` from `src/bp
 
 The UI is not driven per event. A busy agent fires many changes a second, and one repaint per event would be one per event too many, so the probe accumulates into the model (a plain object) and publishes a snapshot signal on a 400 ms window. One repaint per frame, regardless of the event rate.
 
+## Trying it
+
+Two demos. Both stand up a fake agent workspace under `demo/agent-home/` laid out like real agent config (`CLAUDE.md`, `AGENTS.md`, `.claude/skills`, `.claude/memory`), and both scope the monitor by **pid**, so attribution is exact rather than a comm guess.
+
+**`demo/sandbox.sh` puts you in the agent's seat.** It splits a tmux window: md-sentry on top, and below it a shell that *is* the agent's process tree. Anything you type there is tagged `agent`; anything you do from a second terminal is tagged `external`. The shell greets you with a cheat sheet of things to try (an injected append, a dropped skill file, an atomic rewrite, a forked child, and one write the policy should ignore). This is the fastest way to feel what the tool actually distinguishes:
+
+```sh
+make && demo/sandbox.sh
+```
+
+**`demo/run.sh` runs itself.** A scripted agent tampers with its own config on a loop while a "human" edits the same file from outside its process tree, so you can watch the two get attributed differently without typing anything:
+
+```sh
+make && demo/run.sh
+```
+
+Recording either one? `MD_SENTRY_WS=/tmp/agent demo/run.sh` puts the fake agent somewhere short. Paths shorten from the left to keep the basename, so a deep prefix eats the column the write preview needs, which is the part worth showing.
+
+`test/traffic.sh` is the integration counterpart: it exercises the cases a simple append loop never reaches (atomic rewrite, deep nested paths, 30 rapid appends that must coalesce into one row, renames in and out of the policy, a bare `touch`, and two writes that must be dropped). Its header documents what a correct capture looks like for each.
+
+## Testing across kernels
+
+`.github/workflows/kernel-matrix.yml` runs the unit tests on every push, then builds the BPF object and confirms the verifier accepts every program across a range of kernels (6.1, 6.6, 6.12, `bpf-next`) booted under QEMU.
+
 ## Requirements
 
 > [!IMPORTANT]
@@ -340,28 +357,6 @@ node test/lib.test.mjs   # the pure-layer unit tests (no kernel needed)
 BPF objects build on **Linux only**. macOS has no `bpftool` and no kernel BTF, so so `make` there fails fast and tells you to build in a Linux VM. `make bundle` still works anywhere.
 
 Generated and gitignored: `bin/probe.bpf.o`, `src/bpf/include/vmlinux.h`, `src/index.jsx` and `src/dump.bundle.js` (the two bundles), and the `demo/agent-home/` fixture the demo creates.
-
-## Trying it
-
-Two demos. Both stand up a fake agent workspace under `demo/agent-home/` laid out like real agent config (`CLAUDE.md`, `AGENTS.md`, `.claude/skills`, `.claude/memory`), and both scope the monitor by **pid**, so attribution is exact rather than a comm guess.
-
-**`demo/sandbox.sh` puts you in the agent's seat.** It splits a tmux window: md-sentry on top, and below it a shell that *is* the agent's process tree. Anything you type there is tagged `agent`; anything you do from a second terminal is tagged `external`. The shell greets you with a cheat sheet of things to try (an injected append, a dropped skill file, an atomic rewrite, a forked child, and one write the policy should ignore). This is the fastest way to feel what the tool actually distinguishes:
-
-```sh
-make && demo/sandbox.sh
-```
-
-**`demo/run.sh` runs itself.** A scripted agent tampers with its own config on a loop while a "human" edits the same file from outside its process tree, so you can watch the two get attributed differently without typing anything:
-
-```sh
-make && demo/run.sh
-```
-
-`test/traffic.sh` is the integration counterpart: it exercises the cases a simple append loop never reaches (atomic rewrite, deep nested paths, 30 rapid appends that must coalesce into one row, renames in and out of the policy, a bare `touch`, and two writes that must be dropped). Its header documents what a correct capture looks like for each.
-
-## Testing across kernels
-
-`.github/workflows/kernel-matrix.yml` runs the unit tests on every push, then builds the BPF object and confirms the verifier accepts every program across a range of kernels (6.1, 6.6, 6.12, `bpf-next`) booted under QEMU.
 
 ## License
 
