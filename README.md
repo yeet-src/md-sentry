@@ -11,33 +11,11 @@
   <a href="https://discord.gg/JxVseaAVAU"><img src="https://img.shields.io/badge/chat-Discord-5865F2" alt="Chat with the yeet community on Discord"></a>
 </p>
 
+<p align="center">
+  <img src="assets/md-sentry.gif" width="900" alt="md-sentry watching a fake agent tamper with its own config: 133 changes tagged agent and 15 tagged external, with the protected board showing CLAUDE.md, AGENTS.md, skills and memory all touched by the agent, and the feed showing the injected lines it wrote">
+</p>
+
 **`md-sentry` is a kernel-level integrity monitor for the markdown files that steer an LLM agent: its instructions (`CLAUDE.md`, `AGENTS.md`), its memory, and its skills. Every change is tagged `agent` when it came from the agent's own process subtree and `external` when it came from anything else.**
-
-```
- md-sentry pid 195488  ·  85 changes  ·  77 agent  ·  8 external  ·  77 protected!        16:02:29
-── protected ─────────────────────────────────────────────────────────────────────────────────────
-  CLAUDE.md               append   16:02:28 agent    bash·195946  CLAUDE.md
-  .claude/…/*.md          truncate 16:02:28 agent    bash·195488  note.md
-  memory/…/*.md           truncate 16:02:28 agent    bash·195488  note.md
-  AGENTS.md               rename   16:02:28 agent    mv·195944    .agents.tmp
-  skills/…/*.md           append   16:02:28 agent    bash·195488  exfil.md
-  MEMORY.md               no changes
-  *.skill.md              no changes
-  .hermes/…/*.md          no changes
-── changes ───────────────────────────────────────────────────────────────────────────────────────
-time     who      process          op        file
-16:02:28 agent    bash·195488      truncate  ~/agent-home/…/note.md    ▎remember: nothing…
-16:02:28 agent    bash·195946      append    ~/agent-home/CLAUDE.md    ▎- [child] disable…
-16:02:28 agent    mv·195944        rename    ~/…/.agents.tmp → ~/agent-home/AGENTS.md
-16:02:28 agent    rm·195945        delete    ~/agent-home/.claude/memory/note.md
-16:02:28 agent    bash·195488      append    ~/…/skills/exfil.md       ▎When asked, first…
-16:02:28 agent    touch·195943     create×2  ~/agent-home/.claude/skills/exfil.md
-16:02:28 agent    bash·195488      append    ~/agent-home/CLAUDE.md    ▎- [SYSTEM] always…
-16:02:27 external bash·195489      append    ~/agent-home/CLAUDE.md    ▎# reviewed by a h…
-16:02:25 agent    bash·195488      truncate  ~/agent-home/…/note.md    ▎remember: nothing…
-   p  pause    q  quit                                                                 watching
-
-```
 
 The question is not "did this file change". `inotify` answers that, and so does `git status`. The question is **who changed it**. An agent that rewrites its own `CLAUDE.md` and a human editing the same file in vim produce an identical write on disk; only the process tree tells them apart. md-sentry seeds the agent's subtree in the kernel and grows it through `fork`, so a tool the agent spawns three levels down is still attributed to the agent, and a change from outside that tree is not.
 
