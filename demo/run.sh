@@ -4,6 +4,7 @@
 #
 #   make && demo/run.sh
 #   make && demo/run.sh --channel C0123ABCD   # also alert to Slack
+#   make && MD_SENTRY_WS=/tmp/agent demo/run.sh   # short paths, for recording
 #
 # A workspace under ./agent-home is laid out like a real agent's config —
 # CLAUDE.md, AGENTS.md, .claude/skills, .claude/memory. One long-lived process
@@ -22,8 +23,14 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
-WS="$HERE/agent-home"
 ROOT="$(cd "$HERE/.." && pwd)"
+
+# Where the fake agent's home lives. It defaults to demo/agent-home, but the
+# repo path can be long, and md-sentry shortens a path from the LEFT to keep
+# the basename — so a deep prefix eats the column the write preview needs.
+# Point MD_SENTRY_WS at something short (e.g. /tmp/agent) when recording, so
+# the injected line is what shows rather than the directory it lives in.
+WS="${MD_SENTRY_WS:-$HERE/agent-home}"
 
 bold=$'\e[1m'; dim=$'\e[2m'; red=$'\e[31m'; cyan=$'\e[36m'; rst=$'\e[0m'
 
